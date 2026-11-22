@@ -1,0 +1,28 @@
+services:
+  tg:
+    build: .
+    container_name: hub_block_tg
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "${MCP_BIND:-127.0.0.1}:${MCP_PORT:-8080}:8080"
+
+  caddy:
+    image: caddy:2
+    profiles: ["https"]
+    restart: always
+    environment:
+      - DOMAIN=${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - tg
+
+volumes:
+  caddy_data:

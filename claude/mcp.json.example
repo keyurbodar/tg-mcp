@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "vps-tg-ops": {
+      "type": "http",
+      "url": "https://vps.yourdomain.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_MCP_BEARER_TOKEN"
+      }
+    }
+  }
+}
