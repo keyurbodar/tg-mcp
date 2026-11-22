@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import socket
+import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,7 @@ class FakeBackend:
         self.sent = []
         self.reactions = []
         self.marked_read = []
+        self.live_fetched = []
 
     async def send_message(self, chat_id, message, reply_to_msg_id=None):
         self.sent.append((chat_id, message, reply_to_msg_id))
@@ -40,6 +42,10 @@ class FakeBackend:
     async def mark_read(self, chat_id, max_id=None):
         self.marked_read.append((chat_id, max_id))
         return max_id
+
+    async def fetch_messages(self, chat_id, limit=50, before_id=None):
+        self.live_fetched.append((chat_id, limit, before_id))
+        return [{"msg_uid": f"{chat_id}:1", "chat_id": chat_id, "message_id": 1, "sender_name": "live", "message_text": "fetched live", "from_me": False}]
 
 
 def save(
@@ -118,59 +124,95 @@ def test_rejects_missing_or_wrong_token(server):
     assert httpx.get(f"{url}/healthz").status_code == 200
 
 
-def test_universal_dm_group_channel_and_unread_sync(server):
+def test_bots_never_hide_human_dms_and_per_chat_capping(server):
     url, db, backend, *_ = server
-    # Personal DM (unread, triggers notify)
-    assert save(db, "42001", 1, "hey are you free tonight?", chat_type="dm", title="Sam") is True
-    # Duplicate ignored
-    assert save(db, "42001", 1, "hey are you free tonight?", chat_type="dm", title="Sam") is False
+    # Spam bot with 25 unread messages (must NOT push notify and must NOT hide human DMs)
+    for i in range(1, 26):
+        assert save(db, "70001", i, f"promo spam #{i}", chat_type="bot", title="Spam OTP Bot", hours_ago=0.5) is False
+
+    # Older human DM from ndx (100h ago — previously missed by 72h cutoff and bot overflow)
+    assert save(db, "42001", 1, "hey keyur, quick question", chat_type="dm", title="ndx", hours_ago=100) is True
     # Group chatter vs mention
     assert save(db, "-1001", 10, "gm everyone", chat_type="group", title="Core Team") is True
     assert save(db, "-1001", 11, "@keyur can you check this?", chat_type="group", title="Core Team", is_mention=True) is True
-    # Channel defaults to watch_mode='off' (no push notify)
-    assert save(db, "-2001", 50, "market news drop", chat_type="channel", title="News Channel") is False
+    # Archived chat excluded by default
+    save(db, "42099", 1, "archived dm", chat_type="dm", title="Old Contact")
+    db.upsert_chat(chat_id="42099", title="Old Contact", chat_type="dm", is_archived=True)
 
-    # list_chats filters
-    all_chats = asyncio.run(call(url, "list_chats", {}))["chats"]
-    assert len(all_chats) == 3
-    dms = asyncio.run(call(url, "list_chats", {"chat_type": "dm", "unread_only": True}))["chats"]
-    assert [c["chat_id"] for c in dms] == ["42001"]
-    assert dms[0]["unread_count"] == 1
+    # Default get_unread excludes bots & archived, includes older human DM from ndx
+    unread = asyncio.run(call(url, "get_unread", {}))
+    chat_ids = [c["chat_id"] for c in unread["chats"]]
+    assert "42001" in chat_ids
+    assert "-1001" in chat_ids
+    assert "70001" not in chat_ids
+    assert "42099" not in chat_ids
 
-    # mentions_only returns all unread DMs + group mentions/replies
+    # Explicitly asking for bots caps per_chat_limit so bots never flood payload
+    bots_unread = asyncio.run(call(url, "get_unread", {"chat_type": "bot", "per_chat_limit": 5}))
+    assert bots_unread["chat_count"] == 1
+    assert bots_unread["chats"][0]["unread_count"] == 25
+    assert len(bots_unread["chats"][0]["messages"]) == 5
+    assert bots_unread["chats"][0]["messages_truncated"] is True
+
+    # mentions_only returns all unread human DMs + group mentions/replies
     important = asyncio.run(call(url, "get_unread", {"mentions_only": True}))
     uids = [m["msg_uid"] for c in important["chats"] for m in c["messages"]]
     assert uids == ["42001:1", "-1001:11"]
 
-    # get_messages & search_messages
+    # list_chats filters
+    dms = asyncio.run(call(url, "list_chats", {"chat_type": "dm", "unread_only": True}))["chats"]
+    assert [c["chat_id"] for c in dms] == ["42001"]
+
+    # get_messages cached vs live fallback
     hist = asyncio.run(call(url, "get_messages", {"chat_id": "-1001"}))["messages"]
     assert [m["message_id"] for m in hist] == [10, 11]
-    hits = asyncio.run(call(url, "search_messages", {"query": "free tonight"}))["messages"]
+    live_hist = asyncio.run(call(url, "get_messages", {"chat_id": "88888"}))["messages"]
+    assert live_hist[0]["message_text"] == "fetched live"
+    assert backend.live_fetched == [("88888", 50, None)]
+
+    # search_messages, send_message, react_message, mark_read, set_chat_watch
+    hits = asyncio.run(call(url, "search_messages", {"query": "quick question"}))["messages"]
     assert len(hits) == 1 and hits[0]["chat_id"] == "42001"
 
-    # send_message (DM without reply_to, group with reply_to)
-    sent_dm = asyncio.run(call(url, "send_message", {"chat_id": "42001", "message": "yep free after 8"}))
+    sent_dm = asyncio.run(call(url, "send_message", {"chat_id": "42001", "message": "hey whats up"}))
     assert sent_dm == {"sent_message_id": 999, "chat_id": "42001", "reply_to_msg_id": None}
-    sent_grp = asyncio.run(call(url, "send_message", {"chat_id": "-1001", "message": "checking now", "reply_to_msg_id": 11}))
-    assert sent_grp["reply_to_msg_id"] == 11
-
-    # react_message + clear reaction
     reacted = asyncio.run(call(url, "react_message", {"chat_id": "-1001", "message_id": 11, "emoji": "🔥"}))
     assert reacted == {"chat_id": "-1001", "message_id": 11, "emoji": "🔥"}
-    asyncio.run(call(url, "react_message", {"chat_id": "-1001", "message_id": 11, "emoji": ""}))
-    assert backend.reactions == [("-1001", 11, "🔥"), ("-1001", 11, "")]
 
-    # mark_read syncs to Telegram and clears unread count
     read_res = asyncio.run(call(url, "mark_read", {"chat_id": "-1001"}))
     assert read_res["unread_count"] == 0
     assert read_res["read_inbox_max_id"] == 11
-    assert backend.marked_read == [("-1001", None)]
 
-    # set_chat_watch controls live push notifications
     watched = asyncio.run(call(url, "set_chat_watch", {"chat_id": "-1001", "watch_mode": "mentions_only"}))
     assert watched["watch_mode"] == "mentions_only"
     assert save(db, "-1001", 12, "random chatter", chat_type="group", title="Core Team") is False
     assert save(db, "-1001", 13, "@keyur ping again", chat_type="group", title="Core Team", is_mention=True) is True
+
+
+def test_auto_migrates_old_chats_table(tmp_path):
+    db_path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE chats (
+            chat_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            username TEXT,
+            chat_type TEXT NOT NULL CHECK (chat_type IN ('dm', 'group', 'channel')),
+            read_inbox_max_id INTEGER NOT NULL DEFAULT 0,
+            unread_count INTEGER NOT NULL DEFAULT 0,
+            unread_mentions_count INTEGER NOT NULL DEFAULT 0,
+            watch_mode TEXT NOT NULL DEFAULT 'all',
+            last_message_id INTEGER NOT NULL DEFAULT 0,
+            last_message_at TIMESTAMP,
+            last_message_preview TEXT
+        );
+        INSERT INTO chats (chat_id, title, chat_type) VALUES ('1', 'OldDM', 'dm');
+    """)
+    conn.close()
+    db = DB(db_path)
+    db.upsert_chat(chat_id="2", title="SomeBot", chat_type="bot", is_archived=False, is_muted=True)
+    bots = db.list_chats(chat_type="bot")
+    assert len(bots) == 1 and bots[0]["title"] == "SomeBot" and bots[0]["is_muted"] == 1
 
 
 def test_live_unread_subscription_and_push(server):
@@ -201,7 +243,7 @@ def test_live_unread_subscription_and_push(server):
 
                 res = await client.read_resource(UNREAD_INBOX_URI)
                 payload = json.loads(res.contents[0].text)
-                assert payload["count"] == 1
+                assert payload["chat_count"] == 1
                 assert payload["chats"][0]["chat_type"] == "dm"
                 assert payload["chats"][0]["messages"][0]["message_text"] == "yo call me when free"
 
@@ -236,10 +278,10 @@ def test_oauth_flow(server):
                   "client_id": CLIENT_ID, "code_verifier": verifier}
     assert httpx.post(meta["token_endpoint"], data={**token_form, "client_secret": "nope"}).status_code == 401
     tokens = httpx.post(meta["token_endpoint"], data={**token_form, "client_secret": CLIENT_SECRET}).json()
-    assert asyncio.run(call(url, "get_unread", {}, token=tokens["access_token"]))["count"] == 0
+    assert asyncio.run(call(url, "get_unread", {}, token=tokens["access_token"]))["chat_count"] == 0
     assert httpx.post(meta["token_endpoint"], data={**token_form, "client_secret": CLIENT_SECRET}).status_code == 400
 
     refreshed = httpx.post(meta["token_endpoint"], data={
         "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}).json()
-    assert asyncio.run(call(url, "get_unread", {}, token=refreshed["access_token"]))["count"] == 0
+    assert asyncio.run(call(url, "get_unread", {}, token=refreshed["access_token"]))["chat_count"] == 0

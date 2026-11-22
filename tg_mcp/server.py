@@ -26,6 +26,7 @@ class TelegramBackend(Protocol):
     async def send_message(self, chat_id: str, message: str, reply_to_msg_id: int | None = None) -> int: ...
     async def send_reaction(self, chat_id: str, message_id: int, emoji: str) -> None: ...
     async def mark_read(self, chat_id: str, max_id: int | None = None) -> int | None: ...
+    async def fetch_messages(self, chat_id: str, limit: int = 50, before_id: int | None = None) -> list[dict[str, Any]]: ...
 
 
 class InboxNotifier:
@@ -67,23 +68,34 @@ class InboxNotifier:
             subs.discard(session)
 
 
-def _format_unread(db: DB, chat_type: str, mentions_only: bool, hours_back: float, limit: int) -> dict[str, Any]:
-    chats: dict[str, dict] = {}
-    rows = db.get_unread(chat_type=chat_type, mentions_only=mentions_only, hours_back=hours_back, limit=limit)
-    for r in rows:
-        c = chats.setdefault(r["chat_id"], {
-            "chat_id": r["chat_id"],
-            "chat_title": r["chat_title"],
-            "chat_username": r["chat_username"],
-            "chat_type": r["chat_type"],
-            "watch_mode": r["watch_mode"],
-            "messages": [],
-        })
-        c["messages"].append({k: r[k] for k in (
-            "msg_uid", "message_id", "sender_name", "message_text", "msg_timestamp",
-            "is_mention", "is_reply_to_me", "reply_to_msg_id", "reply_to_sender", "reply_to_text",
-        )})
-    return {"count": len(rows), "truncated": len(rows) == limit, "chats": list(chats.values())}
+def _format_unread(
+    db: DB,
+    *,
+    chat_type: str = "all",
+    mentions_only: bool = False,
+    include_bots: bool = False,
+    include_archived: bool = False,
+    hours_back: float | None = None,
+    per_chat_limit: int = 10,
+    max_chats: int = 50,
+) -> dict[str, Any]:
+    chats = db.get_unread(
+        chat_type=chat_type,
+        mentions_only=mentions_only,
+        include_bots=include_bots,
+        include_archived=include_archived,
+        hours_back=hours_back,
+        per_chat_limit=per_chat_limit,
+        max_chats=max_chats,
+    )
+    total_returned = sum(len(c["messages"]) for c in chats)
+    total_unread = sum(c["unread_count"] for c in chats)
+    return {
+        "chat_count": len(chats),
+        "total_unread": total_unread,
+        "messages_returned": total_returned,
+        "chats": chats,
+    }
 
 
 def build_mcp(db: DB, backend: TelegramBackend, provider: Provider, notifier: InboxNotifier | None = None) -> MCPServer:
@@ -91,7 +103,8 @@ def build_mcp(db: DB, backend: TelegramBackend, provider: Provider, notifier: In
     mcp = MCPServer(
         name="tg-mcp",
         instructions=(
-            "Personal Telegram MCP covering DMs, groups, and channels with live Telegram read-state sync. "
+            "Personal Telegram MCP covering human DMs, bots, groups, and channels with live Telegram read-state sync. "
+            "Bots and archived chats are excluded by default so spam bots never bury real DMs. "
             "Subscribe to tg://inbox/unread for instant push notifications. "
             "Never call send_message or react_message without the user's explicit approval first."
         ),
@@ -132,40 +145,63 @@ def build_mcp(db: DB, backend: TelegramBackend, provider: Provider, notifier: In
         UNREAD_INBOX_URI,
         name="unread_inbox",
         title="Unread Telegram Inbox",
-        description="Unread messages across DMs, groups, and channels synced with Telegram read state. Subscribe for live notifications/resources/updated pushes.",
+        description="Unread messages across human DMs, groups, and channels synced with Telegram read state (bots/archived excluded). Subscribe for live pushes.",
         mime_type="application/json",
     )
     def unread_inbox_resource() -> str:
-        return json.dumps(_format_unread(db, chat_type="all", mentions_only=False, hours_back=72, limit=200))
+        return json.dumps(_format_unread(db))
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def list_chats(
-        chat_type: Literal["all", "dm", "group", "channel"] = "all",
+        chat_type: Literal["all", "dm", "bot", "group", "channel"] = "all",
         unread_only: bool = False,
+        include_bots: bool = False,
+        include_archived: bool = False,
         limit: Annotated[int, Field(gt=0, le=500)] = 100,
     ) -> dict[str, Any]:
-        """List Telegram DMs, groups, and channels with live unread counts, mention counts, and last message preview."""
-        chats = db.list_chats(chat_type=chat_type, unread_only=unread_only, limit=limit)
+        """List Telegram chats with live unread counts, mention counts, muted/archived flags, and last preview. 'dm' = real humans only; bots are excluded from 'all' unless include_bots=True."""
+        chats = db.list_chats(
+            chat_type=chat_type,
+            unread_only=unread_only,
+            include_bots=include_bots,
+            include_archived=include_archived,
+            limit=limit,
+        )
         return {"count": len(chats), "chats": chats}
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def get_unread(
-        chat_type: Literal["all", "dm", "group", "channel"] = "all",
+        chat_type: Literal["all", "dm", "bot", "group", "channel"] = "all",
         mentions_only: bool = False,
-        hours_back: Annotated[float, Field(gt=0, le=720)] = 72,
-        limit: Annotated[int, Field(gt=0, le=1000)] = 200,
+        include_bots: bool = False,
+        include_archived: bool = False,
+        hours_back: Annotated[float, Field(gt=0, le=8760)] | None = None,
+        per_chat_limit: Annotated[int, Field(gt=0, le=100)] = 10,
+        max_chats: Annotated[int, Field(gt=0, le=200)] = 50,
     ) -> dict[str, Any]:
-        """Get unread messages grouped by chat, synced with Telegram's actual read state. Set mentions_only=True to get all unread DMs plus direct mentions/replies in groups."""
-        return _format_unread(db, chat_type, mentions_only, hours_back, limit)
+        """Get unread messages grouped by chat (capped per chat so one noisy chat never hides others). Excludes bots and archived chats by default; no age cutoff unless hours_back is set."""
+        return _format_unread(
+            db,
+            chat_type=chat_type,
+            mentions_only=mentions_only,
+            include_bots=include_bots,
+            include_archived=include_archived,
+            hours_back=hours_back,
+            per_chat_limit=per_chat_limit,
+            max_chats=max_chats,
+        )
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
-    def get_messages(
+    async def get_messages(
         chat_id: str,
         limit: Annotated[int, Field(gt=0, le=200)] = 50,
         before_id: int | None = None,
+        live: bool = False,
     ) -> dict[str, Any]:
-        """Read recent messages in any DM, group, or channel in chronological order."""
-        msgs = db.get_messages(chat_id=chat_id, limit=limit, before_id=before_id)
+        """Read recent messages in any DM, bot, group, or channel in chronological order. Automatically falls back to live Telegram history if not cached locally (or pass live=True)."""
+        msgs = [] if live else db.get_messages(chat_id=chat_id, limit=limit, before_id=before_id)
+        if not msgs:
+            msgs = await backend.fetch_messages(chat_id=chat_id, limit=limit, before_id=before_id)
         return {"count": len(msgs), "chat_id": chat_id, "messages": msgs}
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -174,7 +210,7 @@ def build_mcp(db: DB, backend: TelegramBackend, provider: Provider, notifier: In
         chat_id: str | None = None,
         limit: Annotated[int, Field(gt=0, le=200)] = 50,
     ) -> dict[str, Any]:
-        """Search messages across all Telegram DMs, groups, and channels (or inside one specific chat_id)."""
+        """Search cached messages across all Telegram chats (or inside one specific chat_id)."""
         msgs = db.search_messages(query=query, chat_id=chat_id, limit=limit)
         return {"count": len(msgs), "query": query, "messages": msgs}
 
@@ -200,7 +236,7 @@ def build_mcp(db: DB, backend: TelegramBackend, provider: Provider, notifier: In
 
     @mcp.tool()
     async def mark_read(chat_id: str, max_id: int | None = None) -> dict[str, Any]:
-        """Mark a DM, group, or channel as read on Telegram itself (synced across phone/desktop) and in the local cache."""
+        """Mark a DM, bot, group, or channel as read on Telegram itself (synced across phone/desktop) and in the local cache."""
         acked_id = await backend.mark_read(chat_id, max_id=max_id)
         return db.mark_chat_read(chat_id, max_id=acked_id if acked_id is not None else max_id)
 

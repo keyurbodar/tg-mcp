@@ -7,10 +7,13 @@ CREATE TABLE IF NOT EXISTS chats (
     chat_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     username TEXT,
-    chat_type TEXT NOT NULL CHECK (chat_type IN ('dm', 'group', 'channel')),
+    chat_type TEXT NOT NULL CHECK (chat_type IN ('dm', 'bot', 'group', 'channel')),
     read_inbox_max_id INTEGER NOT NULL DEFAULT 0,
     unread_count INTEGER NOT NULL DEFAULT 0,
     unread_mentions_count INTEGER NOT NULL DEFAULT 0,
+    unread_mark BOOLEAN NOT NULL DEFAULT FALSE,
+    is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+    is_muted BOOLEAN NOT NULL DEFAULT FALSE,
     watch_mode TEXT NOT NULL DEFAULT 'all' CHECK (watch_mode IN ('all', 'mentions_only', 'off')),
     last_message_id INTEGER NOT NULL DEFAULT 0,
     last_message_at TIMESTAMP,
@@ -43,7 +46,7 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 );
 """
 
-CHAT_TYPES = ("dm", "group", "channel")
+CHAT_TYPES = ("dm", "bot", "group", "channel")
 WATCH_MODES = ("all", "mentions_only", "off")
 
 
@@ -52,7 +55,7 @@ def msg_pk(chat_id: int | str, message_id: int) -> str:
 
 
 def default_watch_mode(chat_type: str) -> str:
-    return "off" if chat_type == "channel" else "all"
+    return "off" if chat_type in ("channel", "bot") else "all"
 
 
 class DB:
@@ -61,7 +64,43 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
+        self._migrate_if_needed()
         self.conn.executescript(SCHEMA)
+
+    def _migrate_if_needed(self) -> None:
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='chats'"
+        ).fetchone()
+        if row and "'bot'" not in (row["sql"] or ""):
+            self.conn.executescript("""
+                ALTER TABLE chats RENAME TO chats_old;
+                CREATE TABLE chats (
+                    chat_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    username TEXT,
+                    chat_type TEXT NOT NULL CHECK (chat_type IN ('dm', 'bot', 'group', 'channel')),
+                    read_inbox_max_id INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    unread_mentions_count INTEGER NOT NULL DEFAULT 0,
+                    unread_mark BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_archived BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_muted BOOLEAN NOT NULL DEFAULT FALSE,
+                    watch_mode TEXT NOT NULL DEFAULT 'all' CHECK (watch_mode IN ('all', 'mentions_only', 'off')),
+                    last_message_id INTEGER NOT NULL DEFAULT 0,
+                    last_message_at TIMESTAMP,
+                    last_message_preview TEXT
+                );
+                INSERT INTO chats (
+                    chat_id, title, username, chat_type, read_inbox_max_id,
+                    unread_count, unread_mentions_count, watch_mode,
+                    last_message_id, last_message_at, last_message_preview
+                )
+                SELECT chat_id, title, username, chat_type, read_inbox_max_id,
+                       unread_count, unread_mentions_count, watch_mode,
+                       last_message_id, last_message_at, last_message_preview
+                FROM chats_old;
+                DROP TABLE chats_old;
+            """)
 
     def upsert_chat(
         self,
@@ -73,12 +112,18 @@ class DB:
         read_inbox_max_id: int | None = None,
         unread_count: int | None = None,
         unread_mentions_count: int | None = None,
+        unread_mark: bool | None = None,
+        is_archived: bool | None = None,
+        is_muted: bool | None = None,
     ) -> None:
         cid = str(chat_id)
         watch = default_watch_mode(chat_type)
         self.conn.execute(
-            """INSERT INTO chats (chat_id, title, username, chat_type, read_inbox_max_id, unread_count, unread_mentions_count, watch_mode)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO chats (
+                   chat_id, title, username, chat_type, read_inbox_max_id,
+                   unread_count, unread_mentions_count, unread_mark, is_archived, is_muted, watch_mode
+               )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(chat_id) DO UPDATE SET
                    title = excluded.title,
                    username = COALESCE(excluded.username, chats.username),
@@ -88,12 +133,26 @@ class DB:
                        ELSE chats.read_inbox_max_id
                    END,
                    unread_count = COALESCE(?, chats.unread_count),
-                   unread_mentions_count = COALESCE(?, chats.unread_mentions_count)""",
+                   unread_mentions_count = COALESCE(?, chats.unread_mentions_count),
+                   unread_mark = COALESCE(?, chats.unread_mark),
+                   is_archived = COALESCE(?, chats.is_archived),
+                   is_muted = COALESCE(?, chats.is_muted),
+                   watch_mode = CASE
+                       WHEN excluded.chat_type = 'bot' AND chats.chat_type != 'bot' THEN 'off'
+                       ELSE chats.watch_mode
+                   END""",
             (
                 cid, title, username, chat_type,
-                read_inbox_max_id or 0, unread_count or 0, unread_mentions_count or 0, watch,
+                read_inbox_max_id or 0, unread_count or 0, unread_mentions_count or 0,
+                bool(unread_mark) if unread_mark is not None else False,
+                bool(is_archived) if is_archived is not None else False,
+                bool(is_muted) if is_muted is not None else False,
+                watch,
                 read_inbox_max_id, read_inbox_max_id, read_inbox_max_id,
                 unread_count, unread_mentions_count,
+                bool(unread_mark) if unread_mark is not None else None,
+                bool(is_archived) if is_archived is not None else None,
+                bool(is_muted) if is_muted is not None else None,
             ),
         )
 
@@ -138,7 +197,6 @@ class DB:
             ),
         )
 
-        # Update latest message preview if this message is newer
         self.conn.execute(
             """UPDATE chats SET
                    last_message_id = CASE WHEN ? > last_message_id THEN ? ELSE last_message_id END,
@@ -156,7 +214,7 @@ class DB:
             return False
 
         chat = self.conn.execute(
-            "SELECT read_inbox_max_id, watch_mode FROM chats WHERE chat_id = ?", (cid,)
+            "SELECT read_inbox_max_id, watch_mode, is_archived FROM chats WHERE chat_id = ?", (cid,)
         ).fetchone()
         if not chat:
             return False
@@ -172,7 +230,7 @@ class DB:
             )
 
         mode = chat["watch_mode"]
-        if not is_unread or mode == "off":
+        if not is_unread or mode == "off" or chat["is_archived"]:
             return False
         if mode == "mentions_only":
             return bool(is_mention or is_reply_to_me)
@@ -198,27 +256,40 @@ class DB:
             """UPDATE chats SET
                    read_inbox_max_id = ?,
                    unread_count = ?,
-                   unread_mentions_count = ?
+                   unread_mentions_count = ?,
+                   unread_mark = FALSE
                WHERE chat_id = ?""",
             (target_id, int(counts["unread_count"]), int(counts["unread_mentions"]), cid),
         )
         return dict(self.conn.execute("SELECT * FROM chats WHERE chat_id = ?", (cid,)).fetchone())
 
-    def list_chats(self, chat_type: str = "all", unread_only: bool = False, limit: int = 100) -> list[dict]:
+    def list_chats(
+        self,
+        chat_type: str = "all",
+        unread_only: bool = False,
+        include_bots: bool = False,
+        include_archived: bool = False,
+        limit: int = 100,
+    ) -> list[dict]:
         clauses = []
         params: list = []
         if chat_type != "all":
             clauses.append("chat_type = ?")
             params.append(chat_type)
+        elif not include_bots:
+            clauses.append("chat_type != 'bot'")
         if unread_only:
-            clauses.append("unread_count > 0")
+            clauses.append("(unread_count > 0 OR unread_mark = TRUE)")
+        if not include_archived:
+            clauses.append("is_archived = FALSE")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = self.conn.execute(
             f"""SELECT chat_id, title, username, chat_type, unread_count, unread_mentions_count,
-                       read_inbox_max_id, watch_mode, last_message_id, last_message_at, last_message_preview
+                       unread_mark, is_archived, is_muted, read_inbox_max_id, watch_mode,
+                       last_message_id, last_message_at, last_message_preview
                 FROM chats {where}
-                ORDER BY (unread_count > 0) DESC, last_message_at DESC
+                ORDER BY (unread_count > 0 OR unread_mark = TRUE) DESC, (chat_type = 'dm') DESC, last_message_at DESC
                 LIMIT ?""",
             params,
         ).fetchall()
@@ -229,36 +300,79 @@ class DB:
         *,
         chat_type: str = "all",
         mentions_only: bool = False,
-        hours_back: float = 72,
-        limit: int = 200,
+        include_bots: bool = False,
+        include_archived: bool = False,
+        hours_back: float | None = None,
+        per_chat_limit: int = 10,
+        max_chats: int = 50,
     ) -> list[dict]:
-        since = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
-        clauses = [
-            "m.from_me = FALSE",
-            "m.message_id > c.read_inbox_max_id",
-            "m.msg_timestamp >= ?",
-        ]
-        params: list = [since]
+        chat_clauses = ["(unread_count > 0 OR unread_mark = TRUE)"]
+        chat_params: list = []
         if chat_type != "all":
-            clauses.append("c.chat_type = ?")
-            params.append(chat_type)
-        if mentions_only:
-            clauses.append("(m.is_mention = TRUE OR m.is_reply_to_me = TRUE OR c.chat_type = 'dm')")
-        params.append(limit)
-        rows = self.conn.execute(
-            f"""SELECT m.id AS msg_uid, m.chat_id, c.title AS chat_title, c.username AS chat_username,
-                       c.chat_type, c.watch_mode, m.message_id, m.sender_name, m.message_text,
-                       m.msg_timestamp, m.is_mention, m.is_reply_to_me,
-                       m.reply_to_msg_id, p.sender_name AS reply_to_sender, p.message_text AS reply_to_text
-                FROM messages m
-                JOIN chats c ON c.chat_id = m.chat_id
-                LEFT JOIN messages p ON p.chat_id = m.chat_id AND p.message_id = m.reply_to_msg_id
-                WHERE {' AND '.join(clauses)}
-                ORDER BY (c.chat_type = 'dm') DESC, m.msg_timestamp ASC
+            chat_clauses.append("chat_type = ?")
+            chat_params.append(chat_type)
+        elif not include_bots:
+            chat_clauses.append("chat_type != 'bot'")
+        if not include_archived:
+            chat_clauses.append("is_archived = FALSE")
+        chat_params.append(max_chats)
+
+        unread_chats = self.conn.execute(
+            f"""SELECT chat_id, title, username, chat_type, unread_count, unread_mentions_count,
+                       unread_mark, is_muted, read_inbox_max_id, watch_mode, last_message_at, last_message_preview
+                FROM chats
+                WHERE {' AND '.join(chat_clauses)}
+                ORDER BY (chat_type = 'dm') DESC, last_message_at DESC
                 LIMIT ?""",
-            params,
+            chat_params,
         ).fetchall()
-        return [dict(r) for r in rows]
+
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat() if hours_back is not None else None
+        result: list[dict] = []
+        for c in unread_chats:
+            msg_clauses = ["m.chat_id = ?", "m.from_me = FALSE"]
+            msg_params: list = [c["chat_id"]]
+            if not c["unread_mark"] or c["unread_count"] > 0:
+                msg_clauses.append("m.message_id > ?")
+                msg_params.append(int(c["read_inbox_max_id"]))
+            if since is not None:
+                msg_clauses.append("m.msg_timestamp >= ?")
+                msg_params.append(since)
+            if mentions_only and c["chat_type"] != "dm":
+                msg_clauses.append("(m.is_mention = TRUE OR m.is_reply_to_me = TRUE)")
+            msg_params.append(per_chat_limit)
+
+            rows = self.conn.execute(
+                f"""SELECT m.id AS msg_uid, m.message_id, m.sender_name, m.message_text,
+                           m.msg_timestamp, m.is_mention, m.is_reply_to_me,
+                           m.reply_to_msg_id, p.sender_name AS reply_to_sender, p.message_text AS reply_to_text
+                    FROM messages m
+                    LEFT JOIN messages p ON p.chat_id = m.chat_id AND p.message_id = m.reply_to_msg_id
+                    WHERE {' AND '.join(msg_clauses)}
+                    ORDER BY m.message_id DESC
+                    LIMIT ?""",
+                msg_params,
+            ).fetchall()
+            if mentions_only and c["chat_type"] != "dm" and not rows:
+                continue
+            if since is not None and not rows:
+                continue
+            msgs = list(reversed([dict(r) for r in rows]))
+            result.append({
+                "chat_id": c["chat_id"],
+                "chat_title": c["title"],
+                "chat_username": c["username"],
+                "chat_type": c["chat_type"],
+                "unread_count": int(c["unread_count"]),
+                "unread_mentions_count": int(c["unread_mentions_count"]),
+                "unread_mark": bool(c["unread_mark"]),
+                "is_muted": bool(c["is_muted"]),
+                "watch_mode": c["watch_mode"],
+                "last_message_at": c["last_message_at"],
+                "messages_truncated": int(c["unread_count"]) > len(msgs),
+                "messages": msgs,
+            })
+        return result
 
     def get_messages(self, chat_id: str, limit: int = 50, before_id: int | None = None) -> list[dict]:
         params: list = [str(chat_id)]

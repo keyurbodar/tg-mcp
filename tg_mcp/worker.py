@@ -4,6 +4,7 @@ import os
 import sys
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import uvicorn
 from telethon import TelegramClient, events, utils
@@ -36,10 +37,23 @@ def resolve_db_path() -> str:
 def classify_chat(chat) -> tuple[str, str, str | None]:
     if isinstance(chat, User):
         title = utils.get_display_name(chat) or chat.username or str(chat.id)
-        return "dm", title, getattr(chat, "username", None)
+        chat_type = "bot" if getattr(chat, "bot", False) else "dm"
+        return chat_type, title, getattr(chat, "username", None)
     if isinstance(chat, Channel) and chat.broadcast:
         return "channel", getattr(chat, "title", None) or "Channel", getattr(chat, "username", None)
     return "group", getattr(chat, "title", None) or "Group", getattr(chat, "username", None)
+
+
+def dialog_is_muted(raw_dialog) -> bool:
+    settings = getattr(raw_dialog, "notify_settings", None)
+    mute_until = getattr(settings, "mute_until", None)
+    if not mute_until:
+        return False
+    if isinstance(mute_until, datetime):
+        return mute_until > datetime.now(timezone.utc)
+    if isinstance(mute_until, int):
+        return mute_until > int(datetime.now(timezone.utc).timestamp())
+    return False
 
 
 class Telegram:
@@ -91,34 +105,62 @@ class Telegram:
             chat_type, title, username = classify_chat(dialog.entity)
             raw_dialog = getattr(dialog, "dialog", None)
             read_max = int(getattr(raw_dialog, "read_inbox_max_id", 0) or 0)
+            unread_count = int(getattr(dialog, "unread_count", 0) or 0)
+            unread_mentions = int(getattr(dialog, "unread_mentions_count", 0) or 0)
+            unread_mark = bool(getattr(raw_dialog, "unread_mark", False))
+            is_archived = bool(getattr(dialog, "archived", False))
+            is_muted = dialog_is_muted(raw_dialog)
+
             self.db.upsert_chat(
                 chat_id=dialog.id,
                 title=title,
                 username=username,
                 chat_type=chat_type,
                 read_inbox_max_id=read_max,
-                unread_count=int(getattr(dialog, "unread_count", 0) or 0),
-                unread_mentions_count=int(getattr(dialog, "unread_mentions_count", 0) or 0),
+                unread_count=unread_count,
+                unread_mentions_count=unread_mentions,
+                unread_mark=unread_mark,
+                is_archived=is_archived,
+                is_muted=is_muted,
             )
             chat_count += 1
-            if dialog.date is None or dialog.date < cutoff:
+
+            has_unread = unread_count > 0 or unread_mark
+            is_recent = dialog.date is not None and dialog.date >= cutoff
+            if not is_recent and not has_unread:
                 continue
-            async for message in self.client.iter_messages(dialog.entity, limit=per_chat_limit):
-                if message.date < cutoff:
+
+            fetch_limit = per_chat_limit if is_recent else min(max(unread_count, 20), 50)
+            async for message in self.client.iter_messages(dialog.entity, limit=fetch_limit):
+                if is_recent and message.date < cutoff and message.id <= read_max:
                     break
                 await self.ingest(message, dialog.entity, notify=False)
                 msg_count += 1
-            # Re-assert authoritative Telegram unread counts after backfill inserts
+
+            # Re-assert authoritative Telegram unread/archived/muted state after backfill inserts
             self.db.upsert_chat(
                 chat_id=dialog.id,
                 title=title,
                 username=username,
                 chat_type=chat_type,
                 read_inbox_max_id=read_max,
-                unread_count=int(getattr(dialog, "unread_count", 0) or 0),
-                unread_mentions_count=int(getattr(dialog, "unread_mentions_count", 0) or 0),
+                unread_count=unread_count,
+                unread_mentions_count=unread_mentions,
+                unread_mark=unread_mark,
+                is_archived=is_archived,
+                is_muted=is_muted,
             )
         log.info("backfill synced %d chats and stored up to %d messages from the last %sh", chat_count, msg_count, hours)
+
+    async def fetch_messages(self, chat_id: str, limit: int = 50, before_id: int | None = None) -> list[dict[str, Any]]:
+        entity = await self._resolve_entity(chat_id)
+        chat = await self.client.get_entity(entity)
+        kwargs: dict[str, Any] = {"limit": limit}
+        if before_id is not None:
+            kwargs["max_id"] = int(before_id)
+        async for message in self.client.iter_messages(entity, **kwargs):
+            await self.ingest(message, chat, notify=False)
+        return self.db.get_messages(chat_id=chat_id, limit=limit, before_id=before_id)
 
     async def send_message(self, chat_id: str, message: str, reply_to_msg_id: int | None = None) -> int:
         entity = await self._resolve_entity(chat_id)
