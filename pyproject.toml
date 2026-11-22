@@ -1,7 +1,7 @@
 [project]
-name = "hub-block-tg"
-version = "0.1.0"
-description = "Telegram ingestion + remote MCP triage for Hub Block"
+name = "tg-mcp"
+version = "0.2.0"
+description = "Universal personal Telegram MCP server (DMs, groups, channels, unread sync, live push)"
 requires-python = ">=3.12"
 dependencies = [
     "mcp==2.3.0",
@@ -13,4 +13,4 @@ dependencies = [
 test = ["pytest", "httpx"]
 
 [tool.setuptools]
-packages = ["hub_tg"]
+packages = ["tg_mcp"]

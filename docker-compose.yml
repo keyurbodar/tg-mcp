@@ -1,7 +1,7 @@
 services:
   tg:
     build: .
-    container_name: hub_block_tg
+    container_name: tg_mcp
     restart: always
     env_file: .env
     volumes:

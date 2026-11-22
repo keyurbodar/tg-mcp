@@ -23,7 +23,7 @@ init() {
   [ -f .env ] || { cp .env.example .env; chmod 600 .env; }
   mkdir -p data && chown 1000:1000 data 2>/dev/null || chmod 777 data
   [ -n "$(get_env MCP_BEARER_TOKEN)" ] || set_env MCP_BEARER_TOKEN "$(openssl rand -hex 32)"
-  [ -n "$(get_env OAUTH_CLIENT_ID)" ] || set_env OAUTH_CLIENT_ID "hub-block-tg-$(openssl rand -hex 4)"
+  [ -n "$(get_env OAUTH_CLIENT_ID)" ] || set_env OAUTH_CLIENT_ID "tg-mcp-$(openssl rand -hex 4)"
   [ -n "$(get_env OAUTH_CLIENT_SECRET)" ] || set_env OAUTH_CLIENT_SECRET "$(openssl rand -hex 32)"
   for key in TELEGRAM_API_ID TELEGRAM_API_HASH DOMAIN; do
     if [ -z "$(get_env $key)" ] && [ -n "${!key:-}" ]; then set_env "$key" "${!key}"; fi
@@ -36,7 +36,7 @@ login() {
   [ -n "$(get_env TELEGRAM_API_ID)" ] && [ -n "$(get_env TELEGRAM_API_HASH)" ] \
     || { echo "set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env first"; exit 1; }
   rm -f data/.session
-  docker compose run --rm tg python -m hub_tg.login --out /data/.session
+  docker compose run --rm tg python -m tg_mcp.login --out /data/.session
   set_env TELEGRAM_SESSION_STRING "$(cat data/.session)"
   rm -f data/.session
   echo "session saved to .env. next: ./setup.sh up"

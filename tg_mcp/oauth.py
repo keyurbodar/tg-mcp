@@ -100,10 +100,10 @@ class Provider:
     def _form(self, login_id: str, error: str | None) -> HTMLResponse:
         message = f'<p class="err">{html.escape(error)}</p>' if error else ""
         return HTMLResponse(f"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>hub-block-tg login</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>tg-mcp login</title>
 <style>body{{font:15px system-ui,sans-serif;max-width:360px;margin:15vh auto;padding:0 16px}}
 input,button{{width:100%;box-sizing:border-box;padding:10px;margin-top:8px;font:inherit}}.err{{color:#b00}}</style></head>
-<body><h2>hub-block-tg</h2><p>Paste the MCP bearer token to authorize this client.</p>{message}
+<body><h2>tg-mcp</h2><p>Paste the MCP bearer token to authorize this client.</p>{message}
 <form method="post" action="{self.issuer}/login"><input type="hidden" name="id" value="{html.escape(login_id)}">
 <input type="password" name="token" placeholder="MCP_BEARER_TOKEN" autofocus required>
 <button type="submit">Authorize</button></form></body></html>""", status_code=401 if error else 200)

@@ -9,13 +9,13 @@ import uvicorn
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.functions.messages import SendReactionRequest
-from telethon.tl.types import Channel, ReactionEmoji
+from telethon.tl.types import Channel, ReactionEmoji, User
 
 from .db import DB
 from .oauth import Provider
-from .server import PENDING_PINGS_URI, PingNotifier, build_app
+from .server import UNREAD_INBOX_URI, InboxNotifier, build_app
 
-log = logging.getLogger("hub_tg")
+log = logging.getLogger("tg_mcp")
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -25,10 +25,21 @@ def env(name: str, default: str | None = None) -> str:
     return value
 
 
-def default_category(chat, fallback: str) -> str:
+def resolve_db_path() -> str:
+    if os.environ.get("DATABASE_PATH"):
+        return os.environ["DATABASE_PATH"]
+    if os.path.exists("/data/hub_tg.db"):
+        return "/data/hub_tg.db"
+    return "/data/tg_mcp.db"
+
+
+def classify_chat(chat) -> tuple[str, str, str | None]:
+    if isinstance(chat, User):
+        title = utils.get_display_name(chat) or chat.username or str(chat.id)
+        return "dm", title, getattr(chat, "username", None)
     if isinstance(chat, Channel) and chat.broadcast:
-        return "alpha_ecosystem"
-    return fallback
+        return "channel", getattr(chat, "title", None) or "Channel", getattr(chat, "username", None)
+    return "group", getattr(chat, "title", None) or "Group", getattr(chat, "username", None)
 
 
 class Telegram:
@@ -36,90 +47,123 @@ class Telegram:
         self,
         client: TelegramClient,
         db: DB,
-        fallback_category: str,
-        on_new_ping: Callable[[], Awaitable[None]] | None = None,
+        on_new_unread: Callable[[], Awaitable[None]] | None = None,
     ):
         self.client = client
         self.db = db
-        self.fallback_category = fallback_category
-        self.on_new_ping = on_new_ping
+        self.on_new_unread = on_new_unread
+
+    async def _resolve_entity(self, chat_id: str):
+        try:
+            return await self.client.get_input_entity(int(chat_id))
+        except ValueError:
+            await self.client.get_dialogs()
+            return await self.client.get_input_entity(int(chat_id))
 
     async def ingest(self, message, chat, *, notify: bool = False):
         if message.action is not None:
             return
+        chat_type, title, username = classify_chat(chat)
         sender = await message.get_sender()
         name = utils.get_display_name(sender) if sender else ""
-        is_new_ping = self.db.save_message(
+        should_notify = self.db.save_message(
             chat_id=message.chat_id,
-            chat_title=getattr(chat, "title", None) or "Group",
+            title=title,
+            username=username,
+            chat_type=chat_type,
             message_id=message.id,
             sender_id=message.sender_id or 0,
             sender_name=name or "Unknown",
             message_text=message.raw_text or ("[media]" if message.media else ""),
             reply_to_msg_id=message.reply_to_msg_id,
             from_me=bool(message.out),
+            is_mention=bool(getattr(message, "mentioned", False)),
             msg_timestamp=message.date,
-            default_category=default_category(chat, self.fallback_category),
         )
-        if notify and is_new_ping and self.on_new_ping is not None:
-            await self.on_new_ping()
+        if notify and should_notify and self.on_new_unread is not None:
+            await self.on_new_unread()
 
     async def backfill(self, hours: float, per_chat_limit: int):
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-        count = 0
+        chat_count = 0
+        msg_count = 0
         async for dialog in self.client.iter_dialogs():
-            if not (dialog.is_group or dialog.is_channel) or dialog.date is None or dialog.date < cutoff:
+            chat_type, title, username = classify_chat(dialog.entity)
+            raw_dialog = getattr(dialog, "dialog", None)
+            read_max = int(getattr(raw_dialog, "read_inbox_max_id", 0) or 0)
+            self.db.upsert_chat(
+                chat_id=dialog.id,
+                title=title,
+                username=username,
+                chat_type=chat_type,
+                read_inbox_max_id=read_max,
+                unread_count=int(getattr(dialog, "unread_count", 0) or 0),
+                unread_mentions_count=int(getattr(dialog, "unread_mentions_count", 0) or 0),
+            )
+            chat_count += 1
+            if dialog.date is None or dialog.date < cutoff:
                 continue
             async for message in self.client.iter_messages(dialog.entity, limit=per_chat_limit):
                 if message.date < cutoff:
                     break
                 await self.ingest(message, dialog.entity, notify=False)
-                count += 1
-        log.info("backfill stored up to %d messages from the last %sh", count, hours)
+                msg_count += 1
+            # Re-assert authoritative Telegram unread counts after backfill inserts
+            self.db.upsert_chat(
+                chat_id=dialog.id,
+                title=title,
+                username=username,
+                chat_type=chat_type,
+                read_inbox_max_id=read_max,
+                unread_count=int(getattr(dialog, "unread_count", 0) or 0),
+                unread_mentions_count=int(getattr(dialog, "unread_mentions_count", 0) or 0),
+            )
+        log.info("backfill synced %d chats and stored up to %d messages from the last %sh", chat_count, msg_count, hours)
 
-    async def send_reply(self, chat_id: str, reply_to_msg_id: int, message: str) -> int:
-        try:
-            entity = await self.client.get_input_entity(int(chat_id))
-        except ValueError:
-            await self.client.get_dialogs()
-            entity = await self.client.get_input_entity(int(chat_id))
+    async def send_message(self, chat_id: str, message: str, reply_to_msg_id: int | None = None) -> int:
+        entity = await self._resolve_entity(chat_id)
         sent = await self.client.send_message(entity, message, reply_to=reply_to_msg_id, parse_mode=None)
         return sent.id
 
     async def send_reaction(self, chat_id: str, message_id: int, emoji: str) -> None:
-        try:
-            entity = await self.client.get_input_entity(int(chat_id))
-        except ValueError:
-            await self.client.get_dialogs()
-            entity = await self.client.get_input_entity(int(chat_id))
+        entity = await self._resolve_entity(chat_id)
         reaction = [ReactionEmoji(emoticon=emoji)] if emoji else []
         await self.client(SendReactionRequest(peer=entity, msg_id=message_id, reaction=reaction))
+
+    async def mark_read(self, chat_id: str, max_id: int | None = None) -> int | None:
+        entity = await self._resolve_entity(chat_id)
+        await self.client.send_read_acknowledge(entity, max_id=max_id)
+        return max_id
 
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    db = DB(os.environ.get("DATABASE_PATH", "/data/hub_tg.db"))
-    notifier = PingNotifier()
+    db = DB(resolve_db_path())
+    notifier = InboxNotifier()
     client = TelegramClient(StringSession(env("TELEGRAM_SESSION_STRING")), int(env("TELEGRAM_API_ID")), env("TELEGRAM_API_HASH"))
     tg = Telegram(
         client,
         db,
-        os.environ.get("TG_DEFAULT_CATEGORY", "internal_ops"),
-        on_new_ping=lambda: notifier.notify_resource_updated(PENDING_PINGS_URI),
+        on_new_unread=lambda: notifier.notify_resource_updated(UNREAD_INBOX_URI),
     )
 
     @client.on(events.NewMessage)
     async def on_message(event):
-        if not (event.is_group or event.is_channel):
-            return
         try:
             await tg.ingest(event.message, await event.get_chat(), notify=True)
         except Exception:
             log.exception("failed to store message %s in %s", event.id, event.chat_id)
 
+    @client.on(events.MessageRead(inbox=True))
+    async def on_read(event):
+        try:
+            db.mark_chat_read(event.chat_id, max_id=event.max_id)
+        except Exception:
+            log.debug("ignored read event for unknown chat %s", event.chat_id)
+
     await client.connect()
     if not await client.is_user_authorized():
-        sys.exit("TELEGRAM_SESSION_STRING is not authorized; run: docker compose run --rm tg python -m hub_tg.login")
+        sys.exit("TELEGRAM_SESSION_STRING is not authorized; run: docker compose run --rm tg python -m tg_mcp.login")
     me = await client.get_me()
     log.info("telegram connected as %s (%s)", utils.get_display_name(me), me.id)
 

@@ -14,9 +14,9 @@ from mcp.client.client import Client
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 
-from hub_tg.db import DB
-from hub_tg.oauth import Provider
-from hub_tg.server import PENDING_PINGS_URI, PingNotifier, build_app
+from tg_mcp.db import DB
+from tg_mcp.oauth import Provider
+from tg_mcp.server import UNREAD_INBOX_URI, InboxNotifier, build_app
 
 TOKEN = "test-token"
 CLIENT_ID = "gemini"
@@ -24,38 +24,65 @@ CLIENT_SECRET = "s3cret"
 REDIRECT = "http://localhost:7777/oauth/callback"
 
 
-class FakeSender:
+class FakeBackend:
     def __init__(self):
         self.sent = []
         self.reactions = []
+        self.marked_read = []
 
-    async def send_reply(self, chat_id, reply_to_msg_id, message):
-        self.sent.append((chat_id, reply_to_msg_id, message))
+    async def send_message(self, chat_id, message, reply_to_msg_id=None):
+        self.sent.append((chat_id, message, reply_to_msg_id))
         return 999
 
     async def send_reaction(self, chat_id, message_id, emoji):
         self.reactions.append((chat_id, message_id, emoji))
 
+    async def mark_read(self, chat_id, max_id=None):
+        self.marked_read.append((chat_id, max_id))
+        return max_id
 
-def save(db, chat_id, message_id, text, *, from_me=False, reply_to=None, hours_ago=1, title="Ops"):
-    return db.save_message(chat_id=chat_id, chat_title=title, message_id=message_id, sender_id=1,
-                           sender_name="me" if from_me else "alice", message_text=text, reply_to_msg_id=reply_to,
-                           from_me=from_me, msg_timestamp=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
-                           default_category="internal_ops")
+
+def save(
+    db: DB,
+    chat_id: str,
+    message_id: int,
+    text: str,
+    *,
+    chat_type: str = "group",
+    title: str = "Team Chat",
+    from_me: bool = False,
+    is_mention: bool = False,
+    reply_to: int | None = None,
+    hours_ago: float = 1,
+):
+    return db.save_message(
+        chat_id=chat_id,
+        title=title,
+        username=None,
+        chat_type=chat_type,
+        message_id=message_id,
+        sender_id=1,
+        sender_name="me" if from_me else "alice",
+        message_text=text,
+        reply_to_msg_id=reply_to,
+        from_me=from_me,
+        is_mention=is_mention,
+        msg_timestamp=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
+    )
 
 
 @pytest.fixture
 def server(tmp_path):
     db = DB(str(tmp_path / "t.db"))
-    sender = FakeSender()
-    notifier = PingNotifier()
+    backend = FakeBackend()
+    notifier = InboxNotifier()
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
     provider = Provider(db, f"http://127.0.0.1:{port}", TOKEN, CLIENT_ID, CLIENT_SECRET, [], "client_secret_post")
     loop_holder: dict[str, asyncio.AbstractEventLoop] = {}
-    srv = uvicorn.Server(uvicorn.Config(build_app(db, sender, provider, notifier=notifier), host="127.0.0.1", port=port, log_level="warning"))
+    srv = uvicorn.Server(uvicorn.Config(build_app(db, backend, provider, notifier=notifier), host="127.0.0.1", port=port, log_level="warning"))
 
     def run():
         loop = asyncio.new_event_loop()
@@ -67,7 +94,7 @@ def server(tmp_path):
     thread.start()
     while not srv.started:
         time.sleep(0.05)
-    yield f"http://127.0.0.1:{port}", db, sender, notifier, loop_holder["loop"]
+    yield f"http://127.0.0.1:{port}", db, backend, notifier, loop_holder["loop"]
     srv.should_exit = True
     thread.join()
 
@@ -91,48 +118,62 @@ def test_rejects_missing_or_wrong_token(server):
     assert httpx.get(f"{url}/healthz").status_code == 200
 
 
-def test_triage_flow(server):
-    url, db, sender, *_ = server
-    assert save(db, "-100", 1, "can you review the deck?") is True
-    assert save(db, "-100", 1, "can you review the deck?") is False
-    save(db, "-100", 2, "old", hours_ago=200)
-    assert save(db, "-100", 3, "my own msg", from_me=True) is False
-    save(db, "-200", 10, "replied already in app")
-    save(db, "-200", 11, "on it", from_me=True, reply_to=10)
-    save(db, "-300", 20, "partner update", title="Partner X")
-    asyncio.run(call(url, "set_tg_group", {"chat_id": "-300", "category": "partner_bd"}))
+def test_universal_dm_group_channel_and_unread_sync(server):
+    url, db, backend, *_ = server
+    # Personal DM (unread, triggers notify)
+    assert save(db, "42001", 1, "hey are you free tonight?", chat_type="dm", title="Sam") is True
+    # Duplicate ignored
+    assert save(db, "42001", 1, "hey are you free tonight?", chat_type="dm", title="Sam") is False
+    # Group chatter vs mention
+    assert save(db, "-1001", 10, "gm everyone", chat_type="group", title="Core Team") is True
+    assert save(db, "-1001", 11, "@keyur can you check this?", chat_type="group", title="Core Team", is_mention=True) is True
+    # Channel defaults to watch_mode='off' (no push notify)
+    assert save(db, "-2001", 50, "market news drop", chat_type="channel", title="News Channel") is False
 
-    pending = asyncio.run(call(url, "get_pending_tg_pings", {"hours_back": 120}))
-    ids = [m["raw_tg_id"] for g in pending["groups"] for m in g["messages"]]
-    assert sorted(ids) == ["-100:1", "-300:20"]
-    only_ops = asyncio.run(call(url, "get_pending_tg_pings", {"category": "internal_ops"}))
-    assert [g["chat_id"] for g in only_ops["groups"]] == ["-100"]
+    # list_chats filters
+    all_chats = asyncio.run(call(url, "list_chats", {}))["chats"]
+    assert len(all_chats) == 3
+    dms = asyncio.run(call(url, "list_chats", {"chat_type": "dm", "unread_only": True}))["chats"]
+    assert [c["chat_id"] for c in dms] == ["42001"]
+    assert dms[0]["unread_count"] == 1
 
-    sent = asyncio.run(call(url, "send_tg_reply", {"chat_id": "-100", "reply_to_msg_id": 1, "message": "lgtm"}))
-    assert sent["sent_message_id"] == 999
-    assert sender.sent == [("-100", 1, "lgtm")]
+    # mentions_only returns all unread DMs + group mentions/replies
+    important = asyncio.run(call(url, "get_unread", {"mentions_only": True}))
+    uids = [m["msg_uid"] for c in important["chats"] for m in c["messages"]]
+    assert uids == ["42001:1", "-1001:11"]
 
-    routed = asyncio.run(call(url, "route_tg_to_hub_block", {"raw_tg_id": "-300:20", "target_table": "partner_briefs", "payload": {"note": "x"}}))
-    assert routed["target_table"] == "partner_briefs"
+    # get_messages & search_messages
+    hist = asyncio.run(call(url, "get_messages", {"chat_id": "-1001"}))["messages"]
+    assert [m["message_id"] for m in hist] == [10, 11]
+    hits = asyncio.run(call(url, "search_messages", {"query": "free tonight"}))["messages"]
+    assert len(hits) == 1 and hits[0]["chat_id"] == "42001"
 
-    assert asyncio.run(call(url, "get_pending_tg_pings", {"hours_back": 120}))["count"] == 0
-    assert db.conn.execute("SELECT status FROM tg_action_items").fetchone()[0] == "sent"
+    # send_message (DM without reply_to, group with reply_to)
+    sent_dm = asyncio.run(call(url, "send_message", {"chat_id": "42001", "message": "yep free after 8"}))
+    assert sent_dm == {"sent_message_id": 999, "chat_id": "42001", "reply_to_msg_id": None}
+    sent_grp = asyncio.run(call(url, "send_message", {"chat_id": "-1001", "message": "checking now", "reply_to_msg_id": 11}))
+    assert sent_grp["reply_to_msg_id"] == 11
+
+    # react_message + clear reaction
+    reacted = asyncio.run(call(url, "react_message", {"chat_id": "-1001", "message_id": 11, "emoji": "🔥"}))
+    assert reacted == {"chat_id": "-1001", "message_id": 11, "emoji": "🔥"}
+    asyncio.run(call(url, "react_message", {"chat_id": "-1001", "message_id": 11, "emoji": ""}))
+    assert backend.reactions == [("-1001", 11, "🔥"), ("-1001", 11, "")]
+
+    # mark_read syncs to Telegram and clears unread count
+    read_res = asyncio.run(call(url, "mark_read", {"chat_id": "-1001"}))
+    assert read_res["unread_count"] == 0
+    assert read_res["read_inbox_max_id"] == 11
+    assert backend.marked_read == [("-1001", None)]
+
+    # set_chat_watch controls live push notifications
+    watched = asyncio.run(call(url, "set_chat_watch", {"chat_id": "-1001", "watch_mode": "mentions_only"}))
+    assert watched["watch_mode"] == "mentions_only"
+    assert save(db, "-1001", 12, "random chatter", chat_type="group", title="Core Team") is False
+    assert save(db, "-1001", 13, "@keyur ping again", chat_type="group", title="Core Team", is_mention=True) is True
 
 
-def test_react_tg_message(server):
-    url, db, sender, *_ = server
-    assert save(db, "-400", 7, "shipped the recap") is True
-    res = asyncio.run(call(url, "react_tg_message", {"chat_id": "-400", "message_id": 7, "emoji": "🔥", "mark_handled": True}))
-    assert res == {"chat_id": "-400", "message_id": 7, "emoji": "🔥", "marked_handled": True}
-    assert sender.reactions == [("-400", 7, "🔥")]
-    assert asyncio.run(call(url, "get_pending_tg_pings", {"hours_back": 24}))["count"] == 0
-
-    cleared = asyncio.run(call(url, "react_tg_message", {"chat_id": "-400", "message_id": 7, "emoji": ""}))
-    assert cleared == {"chat_id": "-400", "message_id": 7, "emoji": "", "marked_handled": False}
-    assert sender.reactions[-1] == ("-400", 7, "")
-
-
-def test_resource_subscription_and_push_notification(server):
+def test_live_unread_subscription_and_push(server):
     url, db, _, notifier, srv_loop = server
 
     async def run_client():
@@ -142,12 +183,12 @@ def test_resource_subscription_and_push_notification(server):
                 assert client.server_capabilities.resources.subscribe is True
 
                 resources = await client.list_resources()
-                assert any(str(r.uri) == PENDING_PINGS_URI for r in resources.resources)
+                assert any(str(r.uri) == UNREAD_INBOX_URI for r in resources.resources)
 
-                async with client.listen(resource_subscriptions=[PENDING_PINGS_URI]) as sub:
-                    assert save(db, "-500", 42, "@keyur need quick update on ixs") is True
+                async with client.listen(resource_subscriptions=[UNREAD_INBOX_URI]) as sub:
+                    assert save(db, "99001", 5, "yo call me when free", chat_type="dm", title="Alex") is True
                     fut = asyncio.run_coroutine_threadsafe(
-                        notifier.notify_resource_updated(PENDING_PINGS_URI), srv_loop
+                        notifier.notify_resource_updated(UNREAD_INBOX_URI), srv_loop
                     )
                     fut.result(timeout=5)
 
@@ -156,12 +197,13 @@ def test_resource_subscription_and_push_notification(server):
                             return ev
 
                     ev = await asyncio.wait_for(next_event(), timeout=5)
-                    assert str(ev.uri) == PENDING_PINGS_URI
+                    assert str(ev.uri) == UNREAD_INBOX_URI
 
-                res = await client.read_resource(PENDING_PINGS_URI)
+                res = await client.read_resource(UNREAD_INBOX_URI)
                 payload = json.loads(res.contents[0].text)
                 assert payload["count"] == 1
-                assert payload["groups"][0]["messages"][0]["message_text"] == "@keyur need quick update on ixs"
+                assert payload["chats"][0]["chat_type"] == "dm"
+                assert payload["chats"][0]["messages"][0]["message_text"] == "yo call me when free"
 
     asyncio.run(run_client())
 
@@ -194,10 +236,10 @@ def test_oauth_flow(server):
                   "client_id": CLIENT_ID, "code_verifier": verifier}
     assert httpx.post(meta["token_endpoint"], data={**token_form, "client_secret": "nope"}).status_code == 401
     tokens = httpx.post(meta["token_endpoint"], data={**token_form, "client_secret": CLIENT_SECRET}).json()
-    assert asyncio.run(call(url, "get_pending_tg_pings", {}, token=tokens["access_token"]))["count"] == 0
+    assert asyncio.run(call(url, "get_unread", {}, token=tokens["access_token"]))["count"] == 0
     assert httpx.post(meta["token_endpoint"], data={**token_form, "client_secret": CLIENT_SECRET}).status_code == 400
 
     refreshed = httpx.post(meta["token_endpoint"], data={
         "grant_type": "refresh_token", "refresh_token": tokens["refresh_token"],
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}).json()
-    assert asyncio.run(call(url, "get_pending_tg_pings", {}, token=refreshed["access_token"]))["count"] == 0
+    assert asyncio.run(call(url, "get_unread", {}, token=refreshed["access_token"]))["count"] == 0
