@@ -27,10 +27,14 @@ REDIRECT = "http://localhost:7777/oauth/callback"
 class FakeSender:
     def __init__(self):
         self.sent = []
+        self.reactions = []
 
     async def send_reply(self, chat_id, reply_to_msg_id, message):
         self.sent.append((chat_id, reply_to_msg_id, message))
         return 999
+
+    async def send_reaction(self, chat_id, message_id, emoji):
+        self.reactions.append((chat_id, message_id, emoji))
 
 
 def save(db, chat_id, message_id, text, *, from_me=False, reply_to=None, hours_ago=1, title="Ops"):
@@ -113,6 +117,19 @@ def test_triage_flow(server):
 
     assert asyncio.run(call(url, "get_pending_tg_pings", {"hours_back": 120}))["count"] == 0
     assert db.conn.execute("SELECT status FROM tg_action_items").fetchone()[0] == "sent"
+
+
+def test_react_tg_message(server):
+    url, db, sender, *_ = server
+    assert save(db, "-400", 7, "shipped the recap") is True
+    res = asyncio.run(call(url, "react_tg_message", {"chat_id": "-400", "message_id": 7, "emoji": "🔥", "mark_handled": True}))
+    assert res == {"chat_id": "-400", "message_id": 7, "emoji": "🔥", "marked_handled": True}
+    assert sender.reactions == [("-400", 7, "🔥")]
+    assert asyncio.run(call(url, "get_pending_tg_pings", {"hours_back": 24}))["count"] == 0
+
+    cleared = asyncio.run(call(url, "react_tg_message", {"chat_id": "-400", "message_id": 7, "emoji": ""}))
+    assert cleared == {"chat_id": "-400", "message_id": 7, "emoji": "", "marked_handled": False}
+    assert sender.reactions[-1] == ("-400", 7, "")
 
 
 def test_resource_subscription_and_push_notification(server):

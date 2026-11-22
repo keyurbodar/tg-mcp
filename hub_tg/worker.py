@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 import uvicorn
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import Channel, ReactionEmoji
 
 from .db import DB
 from .oauth import Provider
@@ -84,6 +85,15 @@ class Telegram:
             entity = await self.client.get_input_entity(int(chat_id))
         sent = await self.client.send_message(entity, message, reply_to=reply_to_msg_id, parse_mode=None)
         return sent.id
+
+    async def send_reaction(self, chat_id: str, message_id: int, emoji: str) -> None:
+        try:
+            entity = await self.client.get_input_entity(int(chat_id))
+        except ValueError:
+            await self.client.get_dialogs()
+            entity = await self.client.get_input_entity(int(chat_id))
+        reaction = [ReactionEmoji(emoticon=emoji)] if emoji else []
+        await self.client(SendReactionRequest(peer=entity, msg_id=message_id, reaction=reaction))
 
 
 async def main():

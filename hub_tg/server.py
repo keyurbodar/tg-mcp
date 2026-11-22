@@ -24,6 +24,7 @@ PENDING_PINGS_URI = "tg://pings/pending"
 
 class Sender(Protocol):
     async def send_reply(self, chat_id: str, reply_to_msg_id: int, message: str) -> int: ...
+    async def send_reaction(self, chat_id: str, message_id: int, emoji: str) -> None: ...
 
 
 ACTION_CATEGORIES = {
@@ -151,6 +152,18 @@ def build_mcp(db: DB, sender: Sender, provider: Provider, notifier: PingNotifier
         sent_id = await sender.send_reply(chat_id, reply_to_msg_id, message)
         db.record_sent(original, chat_id, original["chat_title"] if original else "", message)
         return {"sent_message_id": sent_id, "chat_id": chat_id, "reply_to_msg_id": reply_to_msg_id}
+
+    @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, openWorldHint=True))
+    async def react_tg_message(
+        chat_id: str,
+        message_id: int,
+        emoji: Annotated[str, Field(max_length=16)] = "👍",
+        mark_handled: bool = False,
+    ) -> dict[str, Any]:
+        """React to a Telegram message with an emoji from the user's personal account (pass empty string to clear). Requires explicit user approval first."""
+        await sender.send_reaction(chat_id, message_id, emoji)
+        handled = db.mark_processed([f"{chat_id}:{message_id}"]) if mark_handled else 0
+        return {"chat_id": chat_id, "message_id": message_id, "emoji": emoji, "marked_handled": bool(handled)}
 
     @mcp.tool()
     def route_tg_to_hub_block(raw_tg_id: str, target_table: Literal["signals", "partner_briefs"], payload: dict[str, Any]) -> dict[str, Any]:
