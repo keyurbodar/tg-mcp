@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS partner_briefs (
     payload TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    token_hash TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('access', 'refresh')),
+    client_id TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    resource TEXT,
+    expires_at INTEGER NOT NULL
+);
 """
 
 CATEGORIES = ("internal_ops", "partner_bd", "alpha_ecosystem", "ignore")
@@ -142,6 +151,23 @@ class DB:
         )
         self.mark_processed([raw_tg_id])
         return new_id
+
+    def save_oauth_token(self, token_hash: str, kind: str, client_id: str, scopes: str, resource: str | None, expires_at: int):
+        self.conn.execute("DELETE FROM oauth_tokens WHERE expires_at < strftime('%s', 'now')")
+        self.conn.execute(
+            "INSERT INTO oauth_tokens (token_hash, kind, client_id, scopes, resource, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (token_hash, kind, client_id, scopes, resource, expires_at),
+        )
+
+    def oauth_token(self, token_hash: str, kind: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM oauth_tokens WHERE token_hash = ? AND kind = ? AND expires_at >= strftime('%s', 'now')",
+            (token_hash, kind),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def delete_oauth_token(self, token_hash: str):
+        self.conn.execute("DELETE FROM oauth_tokens WHERE token_hash = ?", (token_hash,))
 
     def groups(self) -> list[dict]:
         rows = self.conn.execute(

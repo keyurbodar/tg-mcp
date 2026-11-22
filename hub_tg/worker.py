@@ -10,6 +10,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Channel
 
 from .db import DB
+from .oauth import Provider
 from .server import build_app
 
 log = logging.getLogger("hub_tg")
@@ -96,8 +97,19 @@ async def main():
     me = await client.get_me()
     log.info("telegram connected as %s (%s)", utils.get_display_name(me), me.id)
 
+    port = int(os.environ.get("PORT", "8080"))
+    domain = os.environ.get("DOMAIN")
+    provider = Provider(
+        db,
+        issuer=(os.environ.get("PUBLIC_URL") or (f"https://{domain}" if domain else f"http://localhost:{port}")).rstrip("/"),
+        bearer_token=env("MCP_BEARER_TOKEN"),
+        client_id=env("OAUTH_CLIENT_ID"),
+        client_secret=env("OAUTH_CLIENT_SECRET"),
+        redirect_uris=[u.strip() for u in os.environ.get("OAUTH_REDIRECT_URIS", "").split(",") if u.strip()],
+        auth_method=os.environ.get("OAUTH_TOKEN_AUTH_METHOD", "client_secret_post"),
+    )
     server = uvicorn.Server(uvicorn.Config(
-        build_app(db, tg, env("MCP_BEARER_TOKEN")), host="0.0.0.0", port=int(os.environ.get("PORT", "8080")),
+        build_app(db, tg, provider), host="0.0.0.0", port=port,
         log_level="info", proxy_headers=True, forwarded_allow_ips="*",
     ))
     backfill = asyncio.create_task(tg.backfill(float(os.environ.get("BACKFILL_HOURS", "120")),

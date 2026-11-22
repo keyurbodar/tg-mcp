@@ -1,12 +1,14 @@
-import hmac
-import json
 from typing import Annotated, Any, Literal, Protocol
 
+from mcp.server.auth.settings import AuthSettings, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 
 from .db import DB
+from .oauth import Provider
 
 
 class Sender(Protocol):
@@ -21,11 +23,26 @@ ACTION_CATEGORIES = {
 }
 
 
-def build_mcp(db: DB, sender: Sender) -> MCPServer:
+def build_mcp(db: DB, sender: Sender, provider: Provider) -> MCPServer:
     mcp = MCPServer(
         name="hub-block-tg",
         instructions="Telegram triage for Hub Block. Never call send_tg_reply without the user's explicit approval of the exact text.",
+        auth_server_provider=provider,
+        auth=AuthSettings(
+            issuer_url=provider.issuer,
+            resource_server_url=f"{provider.issuer}/mcp",
+            revocation_options=RevocationOptions(enabled=True),
+            validate_token_resource=False,
+        ),
     )
+
+    @mcp.custom_route("/healthz", methods=["GET"])
+    async def healthz(request: Request):
+        return PlainTextResponse("ok")
+
+    @mcp.custom_route("/login", methods=["GET", "POST"])
+    async def login(request: Request):
+        return await provider.login_page(request)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
     def get_pending_tg_pings(
@@ -82,25 +99,5 @@ def build_mcp(db: DB, sender: Sender) -> MCPServer:
     return mcp
 
 
-def with_bearer(app, token: str):
-    expected = f"Bearer {token}".encode()
-
-    async def respond(send, status: int, body: bytes, headers: list):
-        await send({"type": "http.response.start", "status": status, "headers": headers})
-        await send({"type": "http.response.body", "body": body})
-
-    async def guarded(scope, receive, send):
-        if scope["type"] != "http":
-            return await app(scope, receive, send)
-        if scope["path"] == "/healthz":
-            return await respond(send, 200, b"ok", [(b"content-type", b"text/plain")])
-        if not hmac.compare_digest(dict(scope["headers"]).get(b"authorization", b""), expected):
-            return await respond(send, 401, json.dumps({"error": "unauthorized"}).encode(),
-                                 [(b"content-type", b"application/json"), (b"www-authenticate", b"Bearer")])
-        await app(scope, receive, send)
-
-    return guarded
-
-
-def build_app(db: DB, sender: Sender, token: str):
-    return with_bearer(build_mcp(db, sender).streamable_http_app(host="0.0.0.0"), token)
+def build_app(db: DB, sender: Sender, provider: Provider):
+    return build_mcp(db, sender, provider).streamable_http_app(host="0.0.0.0")
