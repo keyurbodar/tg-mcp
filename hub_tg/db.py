@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 """
 
 CATEGORIES = ("internal_ops", "partner_bd", "alpha_ecosystem", "ignore")
+ALERT_CATEGORIES = ("internal_ops", "partner_bd")
 
 
 def raw_id(chat_id: int | str, message_id: int) -> str:
@@ -83,12 +84,12 @@ class DB:
         self.conn.executescript(SCHEMA)
 
     def save_message(self, *, chat_id, chat_title, message_id, sender_id, sender_name,
-                     message_text, reply_to_msg_id, from_me, msg_timestamp, default_category):
+                     message_text, reply_to_msg_id, from_me, msg_timestamp, default_category) -> bool:
         self.conn.execute(
             "INSERT OR IGNORE INTO tg_group_configs (chat_id, chat_title, category) VALUES (?, ?, ?)",
             (str(chat_id), chat_title, default_category),
         )
-        self.conn.execute(
+        cur = self.conn.execute(
             """INSERT OR IGNORE INTO raw_tg_staging
                (id, chat_id, chat_title, message_id, sender_id, sender_name, message_text,
                 reply_to_msg_id, from_me, msg_timestamp, processed)
@@ -99,6 +100,13 @@ class DB:
         )
         if from_me and reply_to_msg_id:
             self.mark_processed([raw_id(chat_id, reply_to_msg_id)])
+        if cur.rowcount == 0 or from_me:
+            return False
+        group = self.conn.execute(
+            "SELECT is_active, category FROM tg_group_configs WHERE chat_id = ?",
+            (str(chat_id),),
+        ).fetchone()
+        return bool(group and group["is_active"] and group["category"] in ALERT_CATEGORIES)
 
     def mark_processed(self, ids: list[str]) -> int:
         cur = self.conn.executemany(
